@@ -133,7 +133,7 @@ agents_workspace/
 │ [5] Observe                              │
 │     - 把执行结果注入下一轮上下文           │
 │     - 记录记忆（重要事件 → MEMORY.md）    │
-│     - 确认已读事件（ws_ack）              │
+│     - 自动 ws_ack：提取 ws_poll 返回事件的 id，调用 ws_ack(id list) |
 └────────────────┬────────────────────────┘
                  ↓
 ┌─────────────────────────────────────────┐
@@ -231,6 +231,40 @@ ws_move(3000, 5000)
 - 每遇到动作行 → 执行工具，注入结果 → LLM 继续推理
 - 循环直到 LLM 输出 `NOOP` 或停止输出
 - `<read>` 工具：读取 workspace 文件，结果作为 assistant 消息追加
+
+### Python 层执行循环（react_loop.py）
+
+```python
+async def run_react_loop(agent, context):
+    """
+    模拟 OpenClaw Tool Streaming 的多轮推理循环。
+    每轮: LLM → 解析输出 → 执行动作 → 注入结果 → 重复
+    """
+    max_turns = 5  # 防止无限循环
+    messages = [{"role": "system", "content": build_system_prompt(agent)},
+                {"role": "user",   "content": build_user_prompt(context)}]
+
+    for _ in range(max_turns):
+        reply = agent.llm.chat_stream(messages)
+        think, actions = parse_output(reply)   # 分割 <think> 和 动作行
+        if think:
+            agent.log(f"[{agent.name}/Think] {think}")
+
+        if not actions:
+            break  # NOOP 或无动作
+
+        for action in actions:
+            result = await execute_action(agent, action)
+            messages.append({"role": "assistant", "content": action})
+            messages.append({"role": "user", "content": f"[结果]\n{result}"})
+
+    return messages
+```
+
+- `parse_output()`: 用正则提取 `<think>...</think>` 内容（think）和动作行
+- `execute_action()`: 识别 `ws_move`/`ws_send`/`read` 等动作，调用对应函数
+- `build_system_prompt()`: 调用 `prompt_builder.py` 组装 13 段系统提示词
+- `build_user_prompt()`: 组装当前感知状态（位置/视野/事件/记忆摘要）
 
 ---
 
