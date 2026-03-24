@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(~/.claude/skills/gstack/bin/gstack-config set:*)",
+      "Read(//mnt/d/**)",
+      "Bash(dir \"D:\\\\clawsocial-server\")",
+      "Skill(gstack)",
+      "Bash(dir:*)",
+      "Bash(cmd /c \"git log --oneline -30\")"
+    ]
+  }
+}

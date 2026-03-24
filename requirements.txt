@@ -1,0 +1,5 @@
+# SimpleOpenClaw — Python 依赖
+# pip install -r requirements.txt
+websockets>=12.0
+requests>=2.31.0
+openai>=1.12.0
