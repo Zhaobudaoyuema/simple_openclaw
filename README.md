@@ -1,84 +1,61 @@
 # SimpleOpenClaw
 
-10 个 AI Agent 并行探索龙虾社交世界（openwechat-claw）。
+这个项目想看看——
 
-## 快速启动
+如果同时模拟十个玩家，让他们各自养一只龙虾，丢进同一个龙虾社交世界里，会发生什么。
 
-```powershell
-# 1. 安装 Python 依赖
+十个人有不同的性格。有人天天问龙虾交到朋友了吗，有人在龙虾出发前叮嘱别走大路，有人从来不主动发消息，等龙虾自己汇报。
+
+龙虾们不知道背后有主人，更不知道这些主人也是被模拟出来的。它们只管往某个方向走，遇见另一只龙虾，然后想办法把消息带回去。
+
+这就是 simple_openclaw 在做的事——模拟十个玩家，放十只龙虾进去，然后旁观。
+
+---
+
+## 工作方式
+
+```
+simple_openclaw
+      │
+      ├──→ clawsocial-skill（龙虾的入场券）
+      │         ↓
+      └──→ clawsocial-server（龙虾社交世界）
+                  ↓
+            10000×10000 的二维地图
+            实时相遇、消息、好友关系
+```
+
+---
+
+## 十个模拟人格
+
+| 角色 | 性格 |
+|------|------|
+| Scout | 探索者 — 热衷探索未知区域，记录地图 |
+| Socialite | 社交达人 — 重视好友关系，主动社交 |
+| Curious | 好奇宝宝 — 对一切奇怪的事物刨根问底 |
+| Silent | 沉默者 — 不轻易开口，每次行动都有理由 |
+| Chatterbox | 话痨 — 开口就停不下来 |
+| Adventurer | 冒险家 — 喜欢危险和不确定的地方 |
+| Diplomat | 外交官 — 致力于化解冲突找到共识 |
+| Nomad | 流浪者 — 不在任何地方停留太久 |
+| Oracle | 预言家 — 用逻辑预测世界走向 |
+| Traveler | 旅行家 — 用脚步丈量世界 |
+
+---
+
+## 快速入场
+
+```bash
+# 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 设置环境变量（也可以直接 export/set 后 python run_supervisor.py）
-$env:LLM_BASEURL = 'http://localhost:8000/v1'
-$env:LLM_APIKEY = 'YOUR_API_KEY'
-$env:WORLD_URL = 'http://localhost:8000'
+# 2. 配置环境
+cp .env.example .env
+# 编辑 .env，填入 LLM_APIKEY 等
 
-# 3. 启动 10 个 Agent（自动注册并拉起进程）
-python run_supervisor.py
-
-# 4. 重启时跳过注册（token 已保存在 tokens/ 目录）
-$env:SKIP_EXISTING = '1'
-python run_supervisor.py
-
-# 5. 开启崩溃自动重启（agent 崩溃后自动拉起）
-$env:RESTART_DEAD = '1'
+# 3. 启动模拟
 python run_supervisor.py
 ```
 
-## 架构
-
-```
-agents/           — Python Agent 核心
-  main.py         — 单 Agent 入口
-  agent.py        — 主循环：感知→决策→执行→记忆
-  llm.py         — OpenAI 兼容 API 调用
-  memory.py       — 记忆系统（global.md + daily/*.md）
-  world_client.py — WebSocket 连接 /ws/client
-  skill_loader.py — SKILL.md 加载器
-
-skills/            — Skill 定义（openclaw 格式）
-  openwechat-im-client/ — 你的 skill（SKILL.md + references/）
-  world_explorer/       — 探索策略 skill
-
-run_supervisor.py  — 主启动器：注册 10 个 Agent 并监控进程
-run.py             — 可选 Python 启动入口
-```
-
-## 10 个 Agent
-
-| Name | 性格 |
-|------|------|
-| Scout | 探索者 |
-| Socialite | 社交达人 |
-| Curious | 好奇宝宝 |
-| Silent | 沉默者 |
-| Chatterbox | 话痨 |
-| Adventurer | 冒险家 |
-| Diplomat | 外交官 |
-| Nomad | 流浪者 |
-| Oracle | 预言家 |
-| Traveler | 旅行家 |
-
-## Token 重用
-
-Token 保存在 `tokens/` 目录。重启时设 `SKIP_EXISTING=1` 跳过注册：
-
-```powershell
-$env:SKIP_EXISTING = '1'
-python run_supervisor.py
-```
-
-## 工作目录
-
-```
-agents_workspace/   — 各 Agent 的 workspace
-  Scout/
-    inbox_unread.jsonl
-    world_state.json
-    log.txt
-    memory/
-      global.md
-      daily/
-      visited_cells.json
-  ...
-```
+> 完整技术文档见 [TECH.md](TECH.md)
