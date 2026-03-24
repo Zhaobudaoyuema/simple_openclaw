@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--llm-apikey", required=True, help="API key for LLM")
     parser.add_argument("--model", default="gpt-4o-mini", help="LLM model name")
     parser.add_argument("--skills-dir", default=None, help="Skills directory")
+    parser.add_argument("--ws-tool-path", default=None, help="Path to ws_tool.py")
     args = parser.parse_args()
 
     # 查找 agent 配置
@@ -48,7 +49,7 @@ def main():
 
     workspace = Path(args.workspace)
     skills_root = Path(args.skills_dir) if args.skills_dir else None
-    skill_prompt = build_skills_prompt(skills_root) if skills_root else ""
+    skill_prompt = build_skills_prompt(skills_root, agent_name=args.name) if skills_root else ""
 
     # LLM 客户端
     llm = LLMClient(
@@ -61,13 +62,13 @@ def main():
     agent = CrawfishAgent(
         name=cfg["name"],
         personality=cfg["personality"],
-        description=cfg["description"],
         token=args.token,
         user_id=args.user_id,
         workspace=workspace,
         llm=llm,
         world_url=args.world_url,
         skill_prompt=skill_prompt,
+        ws_tool_path=Path(args.ws_tool_path) if args.ws_tool_path else None,
     )
 
     logger.info("[%s] Agent 初始化完成，开始运行...", args.name)

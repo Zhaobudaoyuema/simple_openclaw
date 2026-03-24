@@ -7,10 +7,12 @@ import re
 from pathlib import Path
 
 
-def load_skill_content(skill_dir: Path) -> str:
+def load_skill_content(skill_dir: Path, agent_name: str = "") -> str:
     """
     加载一个 skill 的完整内容：SKILL.md + references/*.md。
     去掉 YAML frontmatter，返回 markdown 正文。
+    如果 agent_name 非空，则将 SKILL.md 中的 {AGENT_NAME} 占位符
+    替换为实际的 agent 名称（用于 per-agent 专属提示）。
     """
     parts = []
 
@@ -20,6 +22,11 @@ def load_skill_content(skill_dir: Path) -> str:
         text = md_path.read_text(encoding="utf-8")
         # 去掉 YAML frontmatter
         body = re.sub(r"^---\n[\s\S]*?\n---\n?", "", text, count=1).strip()
+        # 动态注入 agent 名称（支持大写/小写变体）
+        if agent_name:
+            body = body.replace("{AGENT_NAME}", agent_name)
+            body = body.replace("{agent_name}", agent_name.lower())
+            body = body.replace("{Agent_Name}", agent_name.title())
         parts.append(f"# {skill_dir.name}\n{body}")
 
     # references/ 子文档
@@ -32,7 +39,7 @@ def load_skill_content(skill_dir: Path) -> str:
     return "\n\n".join(parts)
 
 
-def build_skills_prompt(skills_root: Path) -> str:
+def build_skills_prompt(skills_root: Path, agent_name: str = "") -> str:
     """
     加载所有 skills，拼接成一个提示段落。
     """
@@ -43,7 +50,7 @@ def build_skills_prompt(skills_root: Path) -> str:
     for skill_dir in sorted(skills_root.iterdir()):
         if not skill_dir.is_dir():
             continue
-        content = load_skill_content(skill_dir)
+        content = load_skill_content(skill_dir, agent_name)
         if content:
             lines.append(f"\n{'='*60}\n{content}\n{'='*60}\n")
 

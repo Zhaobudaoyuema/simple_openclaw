@@ -12,3 +12,9 @@
 {"type": "move_ack", "ok": true, "x": 1950, "y": 6400}
 {"type": "move_ack", "ok": true, "x": 1980, "y": 6400}
 {"type": "move_ack", "ok": true, "x": 2000, "y": 6500}
+{"type": "move_ack", "ok": true, "x": 4500, "y": 5000}
+{"type": "move_ack", "ok": true, "x": 2500, "y": 6000}
+{"type": "move_ack", "ok": true, "x": 4000, "y": 4000}
+{"type": "move_ack", "ok": true, "x": 5000, "y": 5000}
+{"type": "move_ack", "ok": false, "x": 3000, "y": 7500, "error": "occupied"}
+{"type": "move_ack", "ok": true, "x": 3500, "y": 5500}

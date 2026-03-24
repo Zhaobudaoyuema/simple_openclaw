@@ -5,3 +5,6 @@
 {"type": "move_ack", "ok": true, "x": 8650, "y": 4150}
 {"type": "move_ack", "ok": true, "x": 8680, "y": 4170}
 {"type": "move_ack", "ok": true, "x": 8700, "y": 4200}
+{"type": "move_ack", "ok": true, "x": 8000, "y": 4000}
+{"type": "move_ack", "ok": true, "x": 5000, "y": 3500}
+{"type": "move_ack", "ok": true, "x": 8500, "y": 4300}

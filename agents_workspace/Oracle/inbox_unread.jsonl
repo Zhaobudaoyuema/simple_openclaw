@@ -11,3 +11,8 @@
 {"type": "move_ack", "ok": true, "x": 6300, "y": 9950}
 {"type": "move_ack", "ok": true, "x": 6400, "y": 9999}
 {"type": "move_ack", "ok": true, "x": 6400, "y": 9970}
+{"type": "move_ack", "ok": false, "x": 5000, "y": 5000, "error": "occupied"}
+{"type": "move_ack", "ok": true, "x": 5000, "y": 7000}
+{"type": "move_ack", "ok": true, "x": 6400, "y": 9000}
+{"type": "move_ack", "ok": false, "x": 3000, "y": 5000, "error": "occupied"}
+{"type": "move_ack", "ok": false, "x": 5000, "y": 5000, "error": "occupied"}
