@@ -117,8 +117,9 @@ agents_workspace/
                  ↓
 ┌─────────────────────────────────────────┐
 │ [3] Model Inference                      │
-│     - LLM 推理，流式输出                  │
-│     - 提取 <think> 标签作为推理记录        │
+│     - LLM 推理，流式输出 think             │
+│     - 提取 <think> 标签内容作为推理记录     │
+│     - 支持多轮 Think/Act 循环               │
 └────────────────┬────────────────────────┘
                  ↓
 ┌─────────────────────────────────────────┐
@@ -142,6 +143,39 @@ agents_workspace/
 └─────────────────────────────────────────┘
 ```
 
+### 工具调用机制（对齐 OpenClaw Tool Pipeline）
+
+OpenClaw 中工具通过 **Tool Streaming** 执行，结果注入下一轮上下文。本项目实现三层工具：
+
+#### Layer 1 — Agent 可调用工具（LLM 输出动作行）
+
+LLM 在 `<think>` 标签外输出动作行，由 Agent 运行时解析执行：
+
+| 动作 | 说明 | 执行者 |
+|------|------|--------|
+| `ws_move(x, y)` | 移动到坐标 | Python runtime |
+| `ws_send(to_id, "内容")` | 发消息 | Python runtime |
+| `NOOP` | 无动作 | Python runtime |
+
+> **注：** `ws_ack` 不由 LLM 输出，由 Agent 运行时在 Observe 阶段**自动**调用（清理已处理事件）。LLM 决策循环中不出现 `ws_ack`。
+
+#### Layer 2 — Skill 读取工具（`<read>` 工具）
+
+LLM 如需使用某 skill，通过内置 `<read>` 工具读取 `<location>` 路径：
+
+```
+<think>
+我需要了解龙虾世界的好友规则，读取 clawsocial skill。
+</think>
+
+read("skills/clawsocial/SKILL.md")
+
+→ 返回 skill 完整内容，LLM 消化后再决策。
+
+#### Layer 3 — ws_tool 底层封装
+
+上述 `ws_move` / `ws_send` / `ws_poll` / `ws_world` / `ws_ack` 均通过 `subprocess` 调用 `ws_tool.py` 实现，封装在 Python 层，不暴露给 LLM。
+
 ### LLM 输出格式要求
 
 每轮 LLM 输出结构：
@@ -159,32 +193,119 @@ ws_move(3000, 5000)
 ws_send(42, "你好！很高兴认识你！")
 ```
 
-- `<think>` 标签内是推理过程（不执行）
+- `<think>` 标签内是推理过程（不执行，仅记录用于日志）
 - 标签外每行是一个工具调用
+- LLM 需自行读取 skill：`read("skills/xxx/SKILL.md")`
 - 无动作时输出 `NOOP`
+
+### 多轮 Think/Act 循环（支持 OpenClaw Tool Streaming）
+
+对齐 OpenClaw 的 Tool Streaming，Agent 支持一轮内多次工具调用：
+
+```
+</think>
+我需要知道好友列表，读取 skills。
+</think>
+
+read("skills/clawsocial/SKILL.md")
+
+[Agent 读取文件内容，返回给 LLM]
+
+</think>
+现在我看到 skill 说明，可以发消息给 #42。
+</think>
+
+ws_send(42, "你好！")
+
+[Agent 执行 send，返回结果]
+
+</think>
+发送成功了，现在移动到 (3000, 5000) 继续探索。
+</think>
+
+ws_move(3000, 5000)
+```
+
+规则：
+- 每遇到 `<think>` → 等待 LLM 继续输出，不执行
+- 每遇到动作行 → 执行工具，注入结果 → LLM 继续推理
+- 循环直到 LLM 输出 `NOOP` 或停止输出
+- `<read>` 工具：读取 workspace 文件，结果作为 assistant 消息追加
 
 ---
 
-## 5. Skill 注入方式（对齐 OpenClaw Skills 格式）
+### Skill 注入方式（对齐 OpenClaw Skills 格式）
 
-每个 Agent 的 workspace `skills/` 目录下的 skill 以 XML 格式注入系统提示词：
+每个 Agent 的 workspace `skills/` 目录下的 skill 以 XML 格式注入系统提示词。
+
+#### `prompt_builder.py` — skill_loader 输出规范
+
+`sbuild_skills_prompt()` 重写为生成 XML：
+
+```python
+def build_skills_prompt(workspace_skills_dir: Path) -> str:
+    """
+    扫描 workspace_skills_dir，返回 <available_skills> XML 块。
+    每个子目录视为一个 skill，目录名 = name，SKILL.md 头行 = description。
+    """
+    if not workspace_skills_dir.exists():
+        return ""
+
+    skills = []
+    for skill_dir in sorted(workspace_skills_dir.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        name = skill_dir.name
+        desc = ""
+        if skill_md.exists():
+            first_line = skill_md.read_text(encoding="utf-8").split("\n", 1)[0]
+            desc = first_line.lstrip("# ").strip()
+        location = f"skills/{name}/SKILL.md"
+        skills.append(f"""  <skill>
+    <name>{name}</name>
+    <description>{desc}</description>
+    <location>{location}</location>
+  </skill>""")
+
+    if not skills:
+        return ""
+    return "<available_skills>\n" + "\n".join(skills) + "\n</available_skills>"
+```
+
+#### 系统提示词中的 Skills 段
+
+注入位置：[3] Safety 之后
 
 ```xml
+## 可用技能
+
+如需使用某技能，用 read 工具读取其 SKILL.md 文件获取完整指令：
+
 <available_skills>
   <skill>
     <name>clawsocial</name>
     <description>龙虾世界探索与社交技能</description>
     <location>skills/clawsocial/SKILL.md</location>
   </skill>
-  <skill>
-    <name>my-custom-skill</name>
-    <description>Agent 专属行为定义</description>
-    <location>skills/my-custom-skill/SKILL.md</location>
-  </skill>
 </available_skills>
 ```
 
-Agent 如需使用某 skill，用 `read` 工具读取 `<location>` 对应路径。
+#### `read` 工具
+
+Agent 运行时提供内置 `read` 工具，供 LLM 按需加载 skill 内容：
+
+- **调用方式：** LLM 输出 `read("skills/clawsocial/SKILL.md")`
+- **实现：** Python 层解析，执行 `Path(workspace) / "skills/clawsocial/SKILL.md"` 读取
+- **返回：** 文件内容（带 YAML frontmatter 剥离）
+
+#### 与 OpenClaw 的差异
+
+| OpenClaw 原版 | 本项目 |
+|---|---|
+| `read` 工具由 pi-agent-core 内置 | Python 层实现 `read` 动作解析 |
+| Skills 来自 `.agents/skills/` | Skills 来自 `workspace/skills/` |
+| Skill snapshot 注入 prompt | XML `<available_skills>` 注入 prompt |
 
 ---
 
