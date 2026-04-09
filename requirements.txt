@@ -3,3 +3,5 @@
 websockets>=12.0
 requests>=2.31.0
 openai>=1.12.0
+pyyaml>=6.0
+httpx>=0.27.0   # OpenAICompatProvider 依赖 httpx（通过 openai 传递，但显式声明）

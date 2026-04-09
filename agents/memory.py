@@ -157,3 +157,123 @@ class AgentMemory:
         if path.exists():
             return path.read_text(encoding="utf-8")
         return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MemoryConsolidator — Token 预算驱动的记忆归档
+# 参照 nanobot/agent/memory.py 设计
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class MemoryConsolidator:
+    """
+    定期将 session 历史中的信息归档到 long-term memory。
+
+    策略：
+    - 每 N 个 step 检查一次（由外部控制调用频率）
+    - 若 global.md 内容超过阈值，调用 LLM 生成摘要
+    - 摘要写入 global.md；原始记录追加到 HISTORY.md
+    """
+
+    _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
+
+    def __init__(
+        self,
+        memory: AgentMemory,
+        provider,  # LLMProvider
+        model: str,
+        context_window_tokens: int = 16000,
+    ):
+        self.memory = memory
+        self.provider = provider
+        self.model = model
+        self.context_window_tokens = context_window_tokens
+        self._failures = 0
+
+    def get_history_context(self) -> str:
+        """返回当前记忆文件的内容摘要。"""
+        parts = []
+        global_txt = self.memory.read_global()
+        if global_txt.strip():
+            parts.append(f"【长期记忆】\n{global_txt.strip()}")
+        daily_txt = self.memory.read_daily()
+        if daily_txt.strip():
+            parts.append(f"【今日记忆】\n{daily_txt.strip()}")
+        return "\n\n".join(parts) if parts else "(无记忆)"
+
+    async def maybe_consolidate(self, recent_messages: list[dict]) -> bool:
+        """
+        检查是否需要归档。若需要则执行 LLM 总结。
+
+        Args:
+            recent_messages: 最近一轮的 session 消息列表
+
+        Returns:
+            True = 执行了总结；False = 跳过（未触发阈值）
+        """
+        # 简单策略：每 20 轮触发一次，或 global.md 超过 2000 字符时触发
+        history = self.memory.read_global()
+        if len(history) < 2000:
+            return False
+
+        return await self._consolidate(recent_messages)
+
+    async def _consolidate(self, messages: list[dict]) -> bool:
+        """调用 LLM 对最近消息进行总结。"""
+        from agents.providers.base import LLMResponse
+
+        system = (
+            "你是一个记忆整理助手。请从以下对话记录中提取关键信息，"
+            "以简洁的要点形式总结。回复格式：\n"
+            "## 要点\n- ...\n- ...\n\n不要复述细节，只保留重要的知识、决定和事件。"
+        )
+
+        # 取最近 10 条非 system 消息
+        relevant = [m for m in messages if m.get("role") not in ("system",)]
+        relevant = relevant[-20:]
+        user_content = "\n".join(
+            f"[{m.get('role')}] {m.get('content', '')[:500]}"
+            for m in relevant if m.get("content")
+        )
+
+        try:
+            resp: LLMResponse = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content[:3000]},
+                ],
+                model=self.model,
+                max_tokens=512,
+                temperature=0.3,
+            )
+
+            summary = (resp.content or "").strip()
+            if not summary:
+                raise ValueError("LLM 返回空摘要")
+
+            # 写入记忆
+            self.memory.write_global(f"\n\n## 自动总结\n{summary}\n")
+            self.memory.write_daily(f"[自动归档] 生成摘要，长度 {len(summary)} 字")
+            self._failures = 0
+            return True
+
+        except Exception as e:
+            import logging
+            logging.getLogger("memory.consolidator").warning(
+                "记忆总结失败: %s，%d 次连续失败", e, self._failures + 1
+            )
+            self._failures += 1
+
+            if self._failures >= self._MAX_FAILURES_BEFORE_RAW_ARCHIVE:
+                # 降级：原始归档
+                raw = "\n".join(
+                    f"[{m.get('role')}] {m.get('content', '')[:200]}"
+                    for m in (messages or [])[-10:]
+                    if m.get("content")
+                )
+                self.memory.write_daily(f"\n[RAW归档]\n{raw}\n")
+                self._failures = 0
+                import logging as _log
+                _log.getLogger("memory.consolidator").info("已执行原始归档")
+
+            return False

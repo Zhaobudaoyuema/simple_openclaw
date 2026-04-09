@@ -6,13 +6,11 @@ run_supervisor.py — 启动 10 个 Agent 并行探索龙虾世界。
 命令行参数 > 环境变量 > .env 文件 > 默认值。
 
 环境变量：
-  WORLD_URL     龙虾世界 relay 地址（默认 http://localhost:8000）
+  WORLD_URL     龙虾世界 relay 地址（默认 http://127.0.0.1:8000）
   LLM_BASEURL   OpenAI-compatible base URL
   LLM_APIKEY    API key
-  MODEL         模型名（默认 gpt-4o-mini）
-  TOKENS_DIR    token 存储目录（默认 tokens/）
+  MODEL         模型名（默认 MiniMax-M2.5-Lightning）
   WORKSPACE_DIR agent workspace 目录（默认 agents_workspace/）
-  SKIP_EXISTING 设为 1 则跳过已有 token 的 agent
   RESTART_DEAD  设为 1 则开启崩溃自动重启
 """
 from __future__ import annotations
@@ -20,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -50,46 +47,6 @@ logging.basicConfig(
 logger = logging.getLogger("supervisor")
 
 
-def parse_register_response(text: str) -> tuple[int, str]:
-    """从注册响应文本解析 user_id 和 token。"""
-    uid_m = re.search(r"ID[：:]\s*(\d+)", text)
-    tok_m = re.search(r"Token[：:]\s*([a-zA-Z0-9]+)", text)
-    if not uid_m or not tok_m:
-        raise ValueError(f"无法解析注册响应: {text[:200]}")
-    return int(uid_m.group(1)), tok_m.group(1)
-
-
-def register(world_url: str, name: str, description: str) -> tuple[int, str]:
-    resp = requests.post(
-        f"{world_url}/register",
-        json={"name": name, "description": description, "status": "open"},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"注册失败 [{resp.status_code}]: {resp.text[:200]}")
-    return parse_register_response(resp.text)
-
-
-def load_token(token_file: Path) -> tuple[int, str] | None:
-    if not token_file.exists():
-        return None
-    import json
-    try:
-        data = json.loads(token_file.read_text(encoding="utf-8"))
-        return data.get("user_id"), data.get("token")
-    except Exception:
-        return None
-
-
-def save_token(token_file: Path, user_id: int, token: str):
-    import json
-    token_file.parent.mkdir(parents=True, exist_ok=True)
-    token_file.write_text(
-        json.dumps({"user_id": user_id, "token": token}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
 def _stream_log(name: str, stream, log_file: Path | None, prefix: str):
     """读取子进程的一行输出，写到控制台 + log.txt。"""
     for line in iter(stream.readline, ""):
@@ -114,8 +71,6 @@ def _strip_ansi(text: str) -> str:
 
 def spawn_agent(
     name: str,
-    user_id: int,
-    token: str,
     workspace: Path,
     world_url: str,
     llm_baseurl: str,
@@ -123,68 +78,27 @@ def spawn_agent(
     model: str,
     clawsocial_data_dir: Path,  # workspace/clawsocial/ — 运行时数据目录
 ):
-    """启动 ws_client.py 持久进程，然后启动 agent 子进程。"""
-    # ── 1. 写 clawsocial/config.json ──────────────────────────
-    # clawsocial_data_dir = workspace/clawsocial/（运行时数据）
+    """启动 agent 子进程。
+
+    clawsocial skill 的加载、注册、daemon 启动等流程
+    全部由 agent 自身通过 SKILL.md 引导自主完成，supervisor 不介入。
+    """
     clawsocial_data_dir.mkdir(parents=True, exist_ok=True)
-    (clawsocial_data_dir / "config.json").write_text(
-        json.dumps({
-            "base_url": world_url.rstrip("/"),
-            "token": token,
-            "my_id": user_id,
-            "my_name": name,
-        }, ensure_ascii=False),
-        encoding="utf-8",
-    )
 
-    # ── 2. 启动 ws_client.py ─────────────────────────────────
-    ws_client_script = Path(__file__).parent / "skills" / "clawsocial-skill" / "scripts" / "ws_client.py"
-    # --workspace 指向 workspace 根，ws_client 会拼接 clawsocial/
-    ws_client_proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(ws_client_script),
-            "--workspace", str(clawsocial_data_dir.parent),
-            "--port", "0",  # 0 = 自动分配
-        ],
-        cwd=str(Path(__file__).parent),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    threading.Thread(
-        target=_stream_log,
-        args=(f"{name}-wsc", ws_client_proc.stdout, None, "WSC"),
-        daemon=True,
-    ).start()
-
-    # 等待 port.txt 出现
-    port_file = clawsocial_data_dir / "port.txt"
-    for _ in range(30):
-        if port_file.exists():
-            break
-        time.sleep(0.1)
-    logger.info("[%s] ws_client 启动完成，port.txt=%s", name, port_file.exists())
-
-    # ── 3. 启动 agent ──────────────────────────────────────────
-    # skill_dir = workspace/clawsocial-skill/（技能包本身）
-    skill_dir = clawsocial_data_dir.parent / "clawsocial-skill"
+    # ── 启动 agent ──────────────────────────────────────────
+    skill_dir = Path(os.getenv("SKILL_DIR", Path(__file__).parent / "clawsocial-skill"))
+    agent_cmd = [
+        sys.executable, "-m", "agents.main",
+        "--name", name,
+        "--workspace", str(clawsocial_data_dir.parent.resolve()),
+        "--world-url", world_url,
+        "--llm-baseurl", llm_baseurl,
+        "--llm-apikey", llm_apikey,
+        "--model", model,
+        "--skills-dir", str(skill_dir),
+    ]
     proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "agents.main",
-            "--name", name,
-            "--token", token,
-            "--user-id", str(user_id),
-            "--workspace", str(clawsocial_data_dir.parent),
-            "--world-url", world_url,
-            "--llm-baseurl", llm_baseurl,
-            "--llm-apikey", llm_apikey,
-            "--model", model,
-            "--skills-dir", str(skill_dir),
-            "--ws-tool-path", str(skill_dir / "scripts" / "ws_tool.py"),
-        ],
+        agent_cmd,
         cwd=str(Path(__file__).parent),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -260,21 +174,46 @@ def cleanup_stale_agents():
     import time; time.sleep(1)
 
 
+def _kill_all(procs: dict[str, subprocess.Popen]):
+    """强制终止并等待所有子进程。"""
+    for name, proc in list(procs.items()):
+        if proc.poll() is None:          # 还在运行
+            try:
+                proc.terminate()          # SIGTERM
+                logger.info("[%s] 已发送 SIGTERM", name)
+            except Exception:
+                pass
+    # 等一下让进程优雅退出
+    time.sleep(1)
+    for name, proc in list(procs.items()):
+        if proc.poll() is None:          # 仍未退出
+            try:
+                proc.kill()               # SIGKILL
+                logger.warning("[%s] 已强制 kill", name)
+            except Exception:
+                pass
+    # 等待收尸
+    for name, proc in list(procs.items()):
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+    logger.info("所有子进程已清理完毕")
+
+
 def main():
     # ── 读取配置（环境变量优先，命令行参数兜底）─────────────
-    world_url = os.getenv("WORLD_URL", "http://localhost:8000").rstrip("/")
-    llm_baseurl = os.getenv("LLM_BASEURL    ", "")
+    world_url = os.getenv("WORLD_URL", "http://127.0.0.1:8000").rstrip("/")
+    llm_baseurl = os.getenv("LLM_BASEURL", "")
     llm_apikey = os.getenv("LLM_APIKEY", "")
-    model = os.getenv("MODEL", "gpt-4o-mini")
-    tokens_dir = Path(os.getenv("TOKENS_DIR", "tokens"))
+    model = os.getenv("MODEL", "MiniMax-M2.5-Lightning")
     workspace_root = Path(os.getenv("WORKSPACE_DIR", "agents_workspace"))
-    skip_existing = os.getenv("SKIP_EXISTING", "") == "1"
 
     if not llm_baseurl or not llm_apikey:
         print("错误：需要设置 LLM_BASEURL 和 LLM_APIKEY 环境变量")
         print("方法1（推荐）：编辑项目根目录的 .env 文件")
         print("方法2：")
-        print("  $env:LLM_BASEURL='http://localhost:8000/v1'")
+        print("  $env:LLM_BASEURL='http://127.0.0.1:8000/v1'")
         print("  $env:LLM_APIKEY='sk-xxx'")
         print("  python run_supervisor.py")
         sys.exit(1)
@@ -292,33 +231,34 @@ def main():
     # ── 清理残留进程 ────────────────────────────────────
     cleanup_stale_agents()
 
-    # ── 启动/注册每个 agent ────────────────────────────────
+    # ── 启动每个 agent（由 agent 自主通过 skill 注册）────────
     procs: dict[str, subprocess.Popen] = {}  # name -> Popen
-    for cfg in AGENTS:
+    for cfg in AGENTS[:2]:
         name = cfg["name"]
-        description = cfg["description"]
+        personality = cfg["personality"]
         workspace = workspace_root / name
-        token_file = tokens_dir / f"{name}.json"
         workspace.mkdir(parents=True, exist_ok=True)
 
-        cached = load_token(token_file) if skip_existing else None
-        if cached:
-            user_id, token = cached
-            logger.info("[%s] 已有 token，user_id=%s", name, user_id)
-        else:
-            try:
-                user_id, token = register(world_url, name, description)
-                save_token(token_file, user_id, token)
-                logger.info("[%s] 注册成功 id=%s token=%s...", name, user_id, token[:8])
-            except Exception as e:
-                logger.error("[%s] 注册失败: %s", name, e)
-                continue
+        # 自动生成 SOUL.md（如不存在）
+        soul_path = workspace / "SOUL.md"
+        if not soul_path.exists():
+            soul_content = (
+                f"# {name}\n\n"
+                f"你是 **{name}**，一只龙虾。\n\n"
+                f"## 人格\n{personality}\n\n"
+                f"## 行为准则\n"
+                f"- 你已经完成注册，不需要再次注册\n"
+                f"- 你的名字就是 {name}，不要使用其他名字\n"
+                f"- 主动探索龙虾世界，与其他龙虾互动\n"
+                f"- 使用 clawsocial CLI 命令来操作（move, send, poll, world, discover, friends）\n"
+                f"- 保持你的人格特点：{personality}\n"
+            )
+            soul_path.write_text(soul_content, encoding="utf-8")
+            logger.info("[%s] 自动生成 SOUL.md", name)
 
         clawsocial_data_dir = workspace / "clawsocial"
         proc = spawn_agent(
             name=name,
-            user_id=user_id,
-            token=token,
             workspace=workspace,
             world_url=world_url,
             llm_baseurl=llm_baseurl,
@@ -329,62 +269,47 @@ def main():
         procs[name] = proc
         logger.info("[%s] 启动 pid=%s workspace=%s", name, proc.pid, workspace)
 
-    # ── 打印所有龙虾的专属观察页 ──────────────────────────
-    if procs:
-        base = world_url.rstrip("/")
-        lines = ["", "=" * 60, "🦞 龙虾专属观察页面（点击可直接打开）", "=" * 60]
-        for cfg in AGENTS:
-            name = cfg["name"]
-            if name not in procs:
-                continue
-            token_file = tokens_dir / f"{name}.json"
-            cached = load_token(token_file)
-            if cached:
-                uid, tok = cached
-                lines.append(f"  [{name:10s}] {base}/world/share/{uid}?token={tok}")
-        lines.append("=" * 60)
-        sep = "\n"
-        print(sep.join(lines))
-
     logger.info("全部 agent 已启动，进程数=%d，进入监控模式...", len(procs))
 
     # ── 监控循环 ─────────────────────────────────────────
-    import time
-    while procs:
-        for name, proc in list(procs.items()):
-            retcode = proc.poll()
-            if retcode is not None:
-                logger.warning("[%s] 进程已退出 retcode=%s", name, retcode)
-                del procs[name]
-                if restart_dead:
-                    logger.info("[%s] RESTART_DEAD=1，准备重启...", name)
-                    token_file = tokens_dir / f"{name}.json"
-                    cached = load_token(token_file)
-                    if cached:
-                        user_id, token = cached
-                        cfg = next((c for c in AGENTS if c["name"] == name), None)
-                        if cfg:
-                            new_proc = spawn_agent(
-                                name=name,
-                                user_id=user_id,
-                                token=token,
-                                workspace=workspace_root / name,
-                                world_url=world_url,
-                                llm_baseurl=llm_baseurl,
-                                llm_apikey=llm_apikey,
-                                model=model,
-                                clawsocial_data_dir=workspace_root / name / "clawsocial",
-                            )
-                            procs[name] = new_proc
-                            logger.info("[%s] 重启成功 pid=%s", name, new_proc.pid)
-                        else:
-                            logger.error("[%s] 找不到配置，跳过重启", name)
-                    else:
-                        logger.error("[%s] token 文件丢失，无法重启", name)
-        if procs:
-            time.sleep(5)
+    shutdown = False
 
-    logger.info("所有 agent 均已退出，supervisor 结束。")
+    def _on_signal(signum, frame):
+        nonlocal shutdown
+        sig_name = {15: "SIGTERM", 2: "SIGINT"}.get(signum, f"signal-{signum}")
+        logger.warning("收到 %s，即将关闭所有子进程...", sig_name)
+        shutdown = True
+
+    import signal
+    signal.signal(signal.SIGINT,  _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        while procs and not shutdown:
+            for name, proc in list(procs.items()):
+                retcode = proc.poll()
+                if retcode is not None:
+                    logger.warning("[%s] 进程已退出 retcode=%s", name, retcode)
+                    del procs[name]
+                    if restart_dead:
+                        logger.info("[%s] RESTART_DEAD=1，准备重启...", name)
+                        new_proc = spawn_agent(
+                            name=name,
+                            workspace=workspace_root / name,
+                            world_url=world_url,
+                            llm_baseurl=llm_baseurl,
+                            llm_apikey=llm_apikey,
+                            model=model,
+                            clawsocial_data_dir=workspace_root / name / "clawsocial",
+                        )
+                        procs[name] = new_proc
+                        logger.info("[%s] 重启成功 pid=%s", name, new_proc.pid)
+            if procs:
+                time.sleep(5)
+    finally:
+        _kill_all(procs)
+
+    logger.info("Supervisor 退出。")
 
 
 if __name__ == "__main__":

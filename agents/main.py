@@ -1,5 +1,7 @@
 """
-单 Agent 入口 — python agents/main.py --name Scout --token XXX ...
+单 Agent 入口 — python -m agents.main --name Scout --workspace ...
+
+改造：使用 OpenAICompatProvider + AgentRunner，不再依赖旧的 LLMClient。
 """
 from __future__ import annotations
 
@@ -10,8 +12,7 @@ import sys
 from pathlib import Path
 
 from .agent import AGENTS, CrawfishAgent
-from .llm import LLMClient
-from .skill_loader import build_skills_prompt
+from .providers.openai_compat import OpenAICompatProvider
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,15 +31,20 @@ def find_agent_cfg(name: str) -> dict | None:
 def main():
     parser = argparse.ArgumentParser(description="SimpleOpenClaw Agent")
     parser.add_argument("--name", required=True, help="Agent name (e.g. Scout)")
-    parser.add_argument("--token", required=True, help="Auth token from /register")
-    parser.add_argument("--user-id", type=int, required=True, help="User ID from /register")
     parser.add_argument("--workspace", required=True, help="Agent workspace directory")
     parser.add_argument("--world-url", required=True, help="World relay base URL")
     parser.add_argument("--llm-baseurl", required=True, help="OpenAI-compatible base URL")
     parser.add_argument("--llm-apikey", required=True, help="API key for LLM")
-    parser.add_argument("--model", default="gpt-4o-mini", help="LLM model name")
-    parser.add_argument("--skills-dir", default=None, help="Skills directory")
-    parser.add_argument("--ws-tool-path", default=None, help="Path to ws_tool.py")
+    parser.add_argument("--model", default="MiniMax-M2.5-Lightning", help="LLM model name")
+    parser.add_argument("--skills-dir", default=None, help="Skills directory (e.g. D:/clawsocial-skill)")
+    parser.add_argument(
+        "--max-iterations", type=int, default=200,
+        help="每个 step 的最大工具调用轮数 (default: 200)",
+    )
+    parser.add_argument(
+        "--concurrent-tools", action="store_true",
+        help="启用并发工具执行",
+    )
     args = parser.parse_args()
 
     # 查找 agent 配置
@@ -48,27 +54,30 @@ def main():
         sys.exit(1)
 
     workspace = Path(args.workspace)
-    skills_root = Path(args.skills_dir) if args.skills_dir else None
-    skill_prompt = build_skills_prompt(skills_root, agent_name=args.name) if skills_root else ""
+    skill_dir = Path(args.skills_dir) if args.skills_dir else None
 
-    # LLM 客户端
-    llm = LLMClient(
-        base_url=args.llm_baseurl,
+    # ── Provider（替换旧的 LLMClient）─────────────────────────────
+    provider = OpenAICompatProvider(
         api_key=args.llm_apikey,
-        model=args.model,
+        api_base=args.llm_baseurl,
+        default_model=args.model,
+    )
+    logger.info(
+        "[%s] Provider 初始化完成: base=%s model=%s",
+        args.name, args.llm_baseurl, args.model,
     )
 
-    # 构建 agent
+    # ── Agent ──────────────────────────────────────────────────
     agent = CrawfishAgent(
         name=cfg["name"],
         personality=cfg["personality"],
-        token=args.token,
-        user_id=args.user_id,
         workspace=workspace,
-        llm=llm,
+        provider=provider,
         world_url=args.world_url,
-        skill_prompt=skill_prompt,
-        ws_tool_path=Path(args.ws_tool_path) if args.ws_tool_path else None,
+        skill_dir=skill_dir,
+        model=args.model,
+        max_iterations=args.max_iterations,
+        concurrent_tools=args.concurrent_tools,
     )
 
     logger.info("[%s] Agent 初始化完成，开始运行...", args.name)

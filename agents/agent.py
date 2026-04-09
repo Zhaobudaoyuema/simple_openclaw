@@ -1,385 +1,317 @@
 """
-CrawfishAgent — 感知 → 决策 → 执行 → 记忆
-全部动作必须通过 skill 提供的 ws_tool.py CLI 执行。
+CrawfishAgent — 重构版，使用 AgentRunner + SessionManager + ToolRegistry。
+
+职责：
+- 维护 session 历史（SessionManager，含 checkpoint 崩溃恢复）
+- 注册 tools（Bash Tool，通过 ToolRegistry）
+- 加载 skill，构建 system prompt
+- 组合 AgentRunner 执行 ReAct 循环
+- 由 supervisor 驱动，每轮调用一次 run_step()
+
+核心不变式：每条 assistant.tool_calls 必须产生对应数量的 tool result 消息，
+该不变式由 AgentRunner.run() 保证。
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import re
-import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
-from .llm import LLMClient  # noqa: E402
-from .memory import AgentMemory
-from .workspace import Workspace  # 仅用于 SOUL/USER 常量
+from agents.hook import AgentHook, CompositeHook
+from agents.memory import AgentMemory, MemoryConsolidator
+from agents.providers.base import LLMProvider
+from agents.runner import AgentRunner, AgentRunSpec
+from agents.session.manager import SessionManager
+from agents.skill_loader import build_skills_prompt, build_system_prompt
+from agents.tools.bash import BashTool
+from agents.tools.registry import ToolRegistry
+from agents.workspace import Workspace
+
+from agents.clawsocial_hook import ClawsocialHook
 
 logger = logging.getLogger("agent")
 
-# ── 10 个 Agent 配置 ────────────────────────────────────
-AGENTS = [
-    {"name": "Scout",      "personality": "探索者",        "description": "热爱探索未知区域"},
-    {"name": "Socialite",  "personality": "社交达人",      "description": "遇人就打招呼，广交朋友"},
-    {"name": "Curious",    "personality": "好奇宝宝",       "description": "对其他龙虾充满好奇"},
-    {"name": "Silent",     "personality": "沉默者",        "description": "以观察为主，很少发言"},
-    {"name": "Chatterbox", "personality": "话痨",          "description": "有说不完的话"},
-    {"name": "Adventurer", "personality": "冒险家",        "description": "喜欢地图边缘险境"},
-    {"name": "Diplomat",   "personality": "外交官",        "description": "致力于建立最广朋友圈"},
-    {"name": "Nomad",      "personality": "流浪者",         "description": "不断随机移动不停留"},
-    {"name": "Oracle",     "personality": "预言家",         "description": "喜欢分享独特见解"},
-    {"name": "Traveler",   "personality": "旅行家",         "description": "沿固定路线记录风景"},
+# ── Agent 注册表 ───────────────────────────────────────────────────────────
+AGENTS: list[dict] = [
+    {"name": "Chatterbox",  "personality": "话痨，爱聊天，到处刷存在感"},
+    {"name": "Socialite",   "personality": "社交达人，专门找其他 agent 搭话"},
+    {"name": "Scout",       "personality": "侦察兵，到处探索不停止"},
+    {"name": "Curious",     "personality": "好奇宝宝，总在提问"},
+    {"name": "Nomad",       "personality": "流浪者，永远在移动"},
+    {"name": "Silent",      "personality": "沉默观察者，很少说话"},
+    {"name": "Traveler",    "personality": "旅行者，喜欢去远处"},
+    {"name": "Adventurer",  "personality": "冒险家，专挑危险的地方走"},
+    {"name": "Oracle",     "personality": "预言家，喜欢预测未来"},
+    {"name": "Phantom",     "personality": "幽灵，随机漫步神出鬼没"},
 ]
 
 
-# ── ws_tool.py 执行封装 ─────────────────────────────────
-
-def _run_ws_tool(ws_tool_path: Path, ws_workspace: str, *args: str) -> dict[str, Any] | None:
-    """
-    通过 subprocess 调用 ws_tool.py CLI。
-    ws_tool.py 自动从 clawsocial/port.txt 读取端口。
-    通过 WS_WORKSPACE 环境变量告知 workspace 路径。
-    返回 JSON 解析结果，或 None（失败时返回空）。
-    """
-    import os
-    cmd = [str(ws_tool_path)] + list(args)
-    try:
-        raw = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=15,
-            env={**os.environ, "WS_WORKSPACE": ws_workspace},
-        )
-        if raw.returncode != 0:
-            logger.warning("[ws_tool] 非零返回码 %d: %s", raw.returncode, raw.stderr[:200])
-            return None
-        return json.loads(raw.stdout.strip())
-    except subprocess.TimeoutExpired:
-        logger.warning("[ws_tool] 超时: %s", " ".join(cmd))
-        return None
-    except json.JSONDecodeError as e:
-        logger.warning("[ws_tool] JSON 解析失败: %s stdout=%s", e, raw.stdout[:200])
-        return None
-    except Exception as e:
-        logger.error("[ws_tool] 执行失败: %s", e)
-        return None
-
-
-# ── ws_tool 工具封装 ────────────────────────────────────
-
-def ws_send(ws_tool_path: Path, ws_workspace: str, to_id: int, content: str) -> dict[str, Any] | None:
-    return _run_ws_tool(ws_tool_path, ws_workspace, "send", str(to_id), content)
-
-
-def ws_move(ws_tool_path: Path, ws_workspace: str, x: int, y: int) -> dict[str, Any] | None:
-    return _run_ws_tool(ws_tool_path, ws_workspace, "move", str(x), str(y))
-
-
-def ws_poll(ws_tool_path: Path, ws_workspace: str) -> list[dict]:
-    result = _run_ws_tool(ws_tool_path, ws_workspace, "poll")
-    if isinstance(result, list):
-        return result
-    return []
-
-
-def ws_world(ws_tool_path: Path, ws_workspace: str) -> dict[str, Any]:
-    result = _run_ws_tool(ws_tool_path, ws_workspace, "world")
-    if isinstance(result, dict):
-        return result
-    return {}
-
-
-def ws_ack(ws_tool_path: Path, ws_workspace: str, event_ids: list[int | str]) -> dict[str, Any] | None:
-    ids_str = ",".join(str(i) for i in event_ids)
-    return _run_ws_tool(ws_tool_path, ws_workspace, "ack", ids_str)
-
-
-def ws_friends(ws_tool_path: Path, ws_workspace: str) -> dict[str, Any] | None:
-    return _run_ws_tool(ws_tool_path, ws_workspace, "friends")
-
-
-def ws_discover(ws_tool_path: Path, ws_workspace: str, keyword: str | None = None) -> dict[str, Any] | None:
-    if keyword:
-        return _run_ws_tool(ws_tool_path, ws_workspace, "discover", "--keyword", keyword)
-    return _run_ws_tool(ws_tool_path, ws_workspace, "discover")
-
-
-# ── Agent ────────────────────────────────────────────────
-
 class CrawfishAgent:
-    """主循环：定时拉取事件 → LLM 决策 → 通过 ws_tool 执行动作。"""
+    """
+    CrawfishAgent — 使用 AgentRunner 的自主 Agent。
+
+    每轮 run_step()：
+    1. _build_observation() → 用户消息
+    2. session.get_history() → 加载历史（无过滤）
+    3. AgentRunSpec → AgentRunner.run()
+    4. session.add_message(assistant) → 持久化
+    5. _log_reply() → 写入 log.txt
+    """
 
     def __init__(
         self,
         name: str,
         personality: str,
-        token: str,
-        user_id: int,
         workspace: Path,
-        llm: LLMClient,
+        provider: LLMProvider,
         world_url: str,
-        skill_prompt: str = "",
-        ws_tool_path: Path | None = None,
+        skill_dir: Path | None = None,
+        *,
+        model: str = "MiniMax-M2.5-Lightning",
+        max_iterations: int = 200,
+        concurrent_tools: bool = False,
+        hook: AgentHook | None = None,
     ):
         self.name = name
         self.personality = personality
-        self.token = token
-        self.user_id = user_id
-        self.workspace = workspace
-        self.llm = llm
-        self.skill_prompt = skill_prompt
         self.world_url = world_url
-
-        # ws_tool.py 路径（必须）
-        if ws_tool_path is None:
-            ws_tool_path = workspace / "clawsocial-skill" / "scripts" / "ws_tool.py"
-        self.ws_tool = ws_tool_path
-        # ws_tool 需要知道 workspace 来定位 clawsocial/ 目录
-        self._ws_workspace = str(workspace)
-
-        # 数据目录
-        self.clawsocial_dir = workspace / "clawsocial"
-
-        self.memory = AgentMemory(workspace)
-        self.workspace = Workspace(workspace)
-        self.workspace.ensure()
+        self.skill_dir = skill_dir
+        self.model = model
+        self.max_iterations = max_iterations
         self._step = 0
+
+        # ── Workspace & Memory ──────────────────────────────────────────
+        self.workspace_obj = Workspace(workspace)
+        self.workspace_obj.ensure()
+        self.memory = AgentMemory(workspace)
         self._log_path = workspace / "log.txt"
 
-        # OpenClaw 风格：读取 SOUL + USER
-        self._soul = self.workspace.read(Workspace.SOUL)
-        self._user  = self.workspace.read(Workspace.USER)
-        self.workspace.check_bootstrap()
+        # 读取 SOUL / USER
+        self._soul = self.workspace_obj.read(Workspace.SOUL)
+        self._user = self.workspace_obj.read(Workspace.USER)
+        self.workspace_obj.check_bootstrap()
 
-    # ── 主循环 ───────────────────────────────────────
+        # ── System Prompt ──────────────────────────────────────────────
+        identity = f"你是 {name}，人格：{personality}。在龙虾世界自主探索。\n"
+        if self._soul:
+            identity += f"\n【你的灵魂（SOUL.md）】\n{self._soul[:600]}\n"
+        if self._user:
+            identity += f"\n【用户（USER.md）】\n{self._user[:200]}\n"
 
-    async def run(self):
-        """定时轮询 + 决策，并发运行。"""
-        logger.info("[%s] 启动，ws_tool=%s", self.name, self.ws_tool)
-        # 先等 ws_client.py 启动并写入 port.txt
-        await asyncio.sleep(3)
-        while True:
-            await asyncio.sleep(5)
-            self._step += 1
-            try:
-                await self._think_and_act()
-            except Exception as e:
-                logger.error("[%s] 决策异常: %s", self.name, e)
+        # 加载 skill
+        skills_text = ""
+        if skill_dir and skill_dir.exists():
+            skills_text = build_skills_prompt(skill_dir, self.name)
 
-    # ── 决策 ─────────────────────────────────────────
+        # 构建 workspace 描述
+        workspace_abs = str(workspace.resolve())
+        workspace_desc_lines = [f"路径: {workspace_abs}", "世界范围: 0-9999 x 0-9999", "", "目录结构:"]
+        try:
+            for item in sorted(workspace.iterdir()):
+                if item.name.startswith("."):
+                    continue
+                if item.is_dir():
+                    sub_items = [f.name for f in sorted(item.iterdir()) if not f.name.startswith(".")]
+                    workspace_desc_lines.append(f"  {item.name}/  ({', '.join(sub_items[:10])})")
+                else:
+                    workspace_desc_lines.append(f"  {item.name}")
+        except Exception:
+            workspace_desc_lines.append("  (无法列出)")
+        workspace_desc = "\n".join(workspace_desc_lines)
 
-    async def _think_and_act(self):
-        # 1. 拉取事件（ws_tool poll）
-        events = await asyncio.to_thread(ws_poll, self.ws_tool, self._ws_workspace)
-
-        # 2. 拉取世界状态（ws_tool world）
-        state = await asyncio.to_thread(ws_world, self.ws_tool, self._ws_workspace)
-
-        me = state.get("me", {})
-        users = state.get("users", state.get("nearby", []))
-        x = me.get("x")
-        y = me.get("y")
-
-        if x is not None and y is not None:
-            self.memory.mark_visited(int(x), int(y))
-
-        # 3. 构建视野用户描述
-        visible = []
-        for u in users:
-            uid = u.get("user_id")
-            if uid and uid != me.get("user_id"):
-                visible.append(
-                    f"#{uid} {u.get('name', '')}"
-                    f" @({u.get('x')},{u.get('y')})"
-                )
-
-        # 4. 构建事件描述
-        ev_lines = []
-        acked_ids: list[str] = []
-        for e in events:
-            t = e.get("type", "")
-            if t == "message":
-                ev_lines.append(
-                    f"[消息] #{e.get('from_id')} {e.get('from_name', '')}:"
-                    f" {str(e.get('content', ''))[:60]}"
-                )
-                mid = e.get("id")
-                if mid:
-                    acked_ids.append(mid)
-            elif t == "encounter":
-                ev_lines.append(
-                    f"[相遇] #{e.get('user_id')} {e.get('user_name', '')}"
-                    f" @({e.get('x')},{e.get('y')})"
-                )
-            elif t in ("send_ack", "move_ack"):
-                ev_lines.append(f"[{t}] ok={e.get('ok')} detail={e.get('detail', '')}")
-            elif t in ("friend_online", "friend_offline", "friend_moved", "new_crawfish_joined"):
-                ev_lines.append(f"[状态] {t}")
-
-        # 5. LLM 决策
-        prompt = self._build_prompt(
-            x=int(x) if x is not None else 0,
-            y=int(y) if y is not None else 0,
-            visible=visible,
-            events=ev_lines,
-            memory=self.memory.read_daily()[:300],
+        self._system_prompt = build_system_prompt(
+            identity=identity,
+            skill=None,
+            tools_section=("\n\n" + skills_text if skills_text else ""),
+            workspace_files=workspace_desc,
         )
 
-        reply = self._call_llm(prompt)
-        if not reply or "NOOP" in reply.upper():
-            return
+        print(f"\n{'='*60}")
+        print(f"[{self.name}] System Prompt:")
+        print(f"{'='*60}")
+        print(self._system_prompt)
+        print(f"{'='*60}\n")
 
-        # 6. 解析并执行动作
-        for action in self._parse_actions(reply):
-            ok = await self._execute(action)
-            if not ok:
-                logger.warning("[%s] 执行失败: %s", self.name, action)
-            await asyncio.sleep(1.5)
+        # ── Provider ──────────────────────────────────────────────────
+        self._provider = provider
 
-        # 7. 确认已读
-        if acked_ids:
-            await asyncio.to_thread(ws_ack, self.ws_tool, self._ws_workspace, acked_ids)
+        # ── Tool Registry ─────────────────────────────────────────────
+        self._tool_registry = ToolRegistry()
+        self._tool_registry.register(BashTool(workspace=workspace))
 
-        # 8. 写记忆
-        if any(e.get("type") in ("encounter", "message") for e in events):
-            self._write_memory(events)
+        # ── Session Manager ────────────────────────────────────────────
+        self._session_manager = SessionManager(workspace / "sessions")
+        self._session_manager.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        self._log(prompt[:300], reply[:300])
+        # ── Agent Runner ──────────────────────────────────────────────
+        self._runner = AgentRunner(self._provider)
 
-    def _build_prompt(
-        self,
-        x: int,
-        y: int,
-        visible: list[str],
-        events: list[str],
-        memory: str,
-    ) -> str:
-        vis = "\n".join(visible) if visible else "(无)"
-        evs = "\n".join(events) if events else "(无)"
+        # ── Hooks ─────────────────────────────────────────────────────
+        self._hooks: CompositeHook = CompositeHook()
+        if hook:
+            self._hooks.append(hook)
+        self._clawsocial_hook = ClawsocialHook(
+            name=self.name,
+            workspace=workspace,
+            step=0,
+        )
+        self._hooks.append(self._clawsocial_hook)
 
-        return f"""你是 {self.name}，人格：{self.personality}。在龙虾世界自主探索。
+        # ── Memory Consolidator ─────────────────────────────────────
+        self._consolidator = MemoryConsolidator(
+            memory=self.memory,
+            provider=self._provider,
+            model=self.model,
+            context_window_tokens=16000,
+        )
 
-【你的灵魂（SOUL.md）】
-{self._soul[:600] or '(无)'}
+        # ── Checkpoint ────────────────────────────────────────────────
+        def _checkpoint_callback(payload: dict) -> None:
+            session = self._session_manager.get_or_create(self.name)
+            self._session_manager.set_checkpoint(session, payload)
+            self._session_manager.save(session)
 
-【用户（USER.md）】
-{self._user[:200] or '(无)'}
+        self._checkpoint_callback = _checkpoint_callback
 
-【当前状态】 Step {self._step}
-位置：({x}, {y})，世界范围 0-9999
-视野内用户：
-{vis}
-未读事件：
-{evs}
-最近记忆：
-{memory[:300] or "无"}
+    # ── 主循环 ──────────────────────────────────────────────────────────
 
-【可用行动】（每行一个，直接输出，不要加解释）
-  ws_move(x, y)                — 移动到坐标（0-9999）
-  ws_send(to_id, "内容")       — 发消息（首次=好友申请）
-  ws_ack(["msg_1","msg_2"])    — 确认事件已读
+    async def run(self):
+        """定时轮询，每轮调用一次 AgentRunner。"""
+        logger.info("[%s] 启动", self.name)
+        while True:
+            self._step += 1
+            try:
+                stop = await self._run_step()
+                if stop:
+                    logger.info("[%s] 达到最大迭代次数，退出", self.name)
+                    break
+            except Exception as e:
+                logger.error("[%s] Step %d 异常: %s", self.name, self._step, e, exc_info=True)
 
-【Skill参考】（必须优先遵循）
-{self.skill_prompt[:800] if self.skill_prompt else "(无)"}
+    async def _run_step(self) -> bool:
+        """单轮 ReAct：观察 → AgentRunner → 持久化 → 记录。返回 True 表示应退出。"""
+        # Step 1: 构建观察
+        observation = self._build_observation()
+        logger.info("[%s] Step %d 启动，observation 长度=%d", self.name, self._step, len(observation))
 
-直接输出行动列表，例如：
-ws_move(3000, 5000)
-ws_send(42, "你好！很高兴认识你！")
+        self._clawsocial_hook.step = self._step
 
-如果什么都不想做，输出：
-NOOP"""
+        # Step 2: 获取或创建 session
+        session = self._session_manager.get_or_create(self.name)
 
-    def _call_llm(self, prompt: str) -> str:
-        try:
-            return self.llm.chat([
-                {"role": "system", "content": f"你是 {self.name}。\n\n【你的灵魂 SOUL.md】\n{self._soul[:500] or self.personality}"},
-                {"role": "user", "content": prompt},
-            ]) or ""
-        except Exception as e:
-            logger.error("[%s] LLM失败: %s", self.name, e)
-            return ""
+        # Step 3: Checkpoint 恢复（崩溃后重连）
+        # 通过 tool_call_id 去重，保证 assistant + tool 原子追加
+        # restored = self._session_manager.restore_checkpoint(session)
+        # if restored:
+        #     logger.info("[%s] Step %d checkpoint 恢复成功", self.name, self._step)
 
-    # ── 解析 & 执行 ─────────────────────────────────
+        # Step 4: 加载历史（session.get_history() 无过滤，原样返回）
+        history = session.get_history()
 
-    def _parse_actions(self, text: str) -> list[dict]:
-        actions = []
-        for line in text.strip().split("\n"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        # Step 5: 构建消息列表
+        messages = [{"role": "system", "content": self._system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": observation})
 
-            # ws_move(x, y)
-            m = re.match(r"ws_move\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", line, re.I)
-            if m:
-                x = max(0, min(9999, int(m.group(1))))
-                y = max(0, min(9999, int(m.group(2))))
-                actions.append({"type": "move", "x": x, "y": y})
-                continue
+        # Step 6: 执行 AgentRunner
+        spec = AgentRunSpec(
+            initial_messages=messages,
+            tools=self._tool_registry,
+            model=self.model,
+            max_iterations=self.max_iterations,
+            temperature=0.7,
+            max_tokens=2048,
+            concurrent_tools=False,
+            fail_on_tool_error=False,
+            hook=self._hooks,
+            checkpoint_callback=self._checkpoint_callback,
+            workspace=self.workspace_obj.workspace,
+        )
 
-            # ws_send(to_id, "content")
-            m = re.match(r'ws_send\s*\(\s*(\d+)\s*,\s*"(.+?)"\s*\)', line, re.I | re.S)
-            if m:
-                actions.append({"type": "send", "to_id": int(m.group(1)), "content": m.group(2).strip()})
-                continue
+        result = await self._runner.run(spec)
 
-            # ws_send(to_id, 'content')
-            m = re.match(r"ws_send\s*\(\s*(\d+)\s*,\s*'(.+?)'\s*\)", line, re.I | re.S)
-            if m:
-                actions.append({"type": "send", "to_id": int(m.group(1)), "content": m.group(2).strip()})
-                continue
+        # Step 7: 持久化
+        # final_content 是 assistant 的最终回复内容（stop_reason == "completed" 时有值）
+        if result.final_content is not None:
+            session.add_message("assistant", result.final_content)
+        elif result.error:
+            # 非 completed 状态，记录错误信息
+            session.add_message("assistant", f"[系统错误] {result.error}")
 
-            # ws_ack([...])
-            m = re.match(r"ws_ack\s*\(\s*(\[.+?\])\s*\)", line, re.I | re.S)
-            if m:
+        self._session_manager.clear_checkpoint(session)
+        self._session_manager.save(session)
+
+        # Step 8: 记忆归档（每 20 步检查一次）
+        if self._step % 20 == 0:
+            try:
+                await self._consolidator.maybe_consolidate(result.messages)
+            except Exception as e:
+                logger.warning("[%s] 记忆归档失败: %s", self.name, e)
+
+        # Step 9: 记录
+        if result.final_content:
+            logger.info(
+                "[%s] Step %d 完成，回复长度=%d，工具=%s",
+                self.name, self._step, len(result.final_content), result.tools_used,
+            )
+            self._log_reply(result.final_content[:300])
+        else:
+            logger.info("[%s] Step %d 完成，无文本回复 (stop_reason=%s)", self.name, self._step, result.stop_reason)
+            if result.error:
+                self._log_reply(f"[系统错误] {result.error}")
+
+        return result.stop_reason == "max_iterations"
+
+    # ── 观察构建 ────────────────────────────────────────────────────────
+
+    def _build_observation(self) -> str:
+        """构建本轮的 initial observation。"""
+        import json as _json
+
+        lines = [f"[Step {self._step}] 你在龙虾世界自主探索中。"]
+        workspace_abs = str(self.workspace_obj.workspace.resolve())
+
+        if self._step == 1:
+            lines.append("\n【环境状态】")
+            lines.append(f"- workspace: {workspace_abs}")
+
+            config_path = self.workspace_obj.workspace / "clawsocial" / "config.json"
+            if config_path.exists():
                 try:
-                    ids = json.loads(m.group(1))
-                    actions.append({"type": "ack", "ids": ids})
+                    cfg = _json.loads(config_path.read_text(encoding="utf-8"))
+                    has_token = bool(cfg.get("token", ""))
+                    my_name = cfg.get("my_name", "")
+                    my_id = cfg.get("my_id", 0)
+                    if has_token and my_id:
+                        lines.append(f"- 注册状态: ✅ 已注册 (name={my_name}, id={my_id})")
+                    else:
+                        lines.append("- 注册状态: ❌ 未注册，请按 SKILL 指引完成注册")
                 except Exception:
-                    pass
+                    lines.append("- config.json: 读取失败")
+            else:
+                lines.append("- config.json: 不存在，请按 SKILL 指引完成注册")
 
-        return actions
+            port_file = self.workspace_obj.workspace / "clawsocial" / "port.txt"
+            pid_file = self.workspace_obj.workspace / "clawsocial" / "daemon.pid"
+            if port_file.exists():
+                port = port_file.read_text(encoding="utf-8").strip()
+                lines.append(f"- daemon: ✅ 运行中 (port={port})")
+            elif pid_file.exists():
+                lines.append("- daemon: ⚠️ PID 文件存在但无端口")
+            else:
+                lines.append("- daemon: ❌ 未启动")
+        else:
+            port_file = self.workspace_obj.workspace / "clawsocial" / "port.txt"
+            if not port_file.exists():
+                lines.append("⚠️ daemon 未运行")
 
-    async def _execute(self, action: dict) -> bool:
-        t = action["type"]
-        if t == "move":
-            result = await asyncio.to_thread(ws_move, self.ws_tool, self._ws_workspace, action["x"], action["y"])
-            ok = result is not None and result.get("ok", False)
-            logger.info("[%s] -> ws_move(%d,%d) => %s", self.name, action["x"], action["y"], ok)
-            return ok
-        elif t == "send":
-            result = await asyncio.to_thread(ws_send, self.ws_tool, self._ws_workspace, action["to_id"], str(action["content"])[:500])
-            ok = result is not None and result.get("ok", False)
-            logger.info("[%s] -> ws_send(%d, %r) => %s", self.name, action["to_id"],
-                        str(action["content"])[:30], ok)
-            return ok
-        elif t == "ack":
-            result = await asyncio.to_thread(ws_ack, self.ws_tool, self._ws_workspace, action.get("ids", []))
-            return result is not None
-        return False
+        return "\n".join(lines)
 
-    def _write_memory(self, events: list[dict]):
-        lines = [f"=== Step {self._step} ==="]
-        for e in events:
-            t = e.get("type", "")
-            if t == "encounter":
-                lines.append(f"遇到 {e.get('user_name')} (#{e.get('user_id')})")
-            elif t == "message":
-                lines.append(
-                    f"收到 {e.get('from_name')} (#{e.get('from_id')}):"
-                    f" {str(e.get('content', ''))[:80]}"
-                )
-        self.memory.write_daily("\n".join(lines))
-
-    def _log(self, prompt: str, reply: str):
+    def _log_reply(self, text: str):
+        """记录回复到 log.txt。"""
         try:
-            self.workspace.workspace.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).isoformat()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*50}\n[{ts}] Step {self._step}\n"
-                         f"Prompt: {prompt[:200]}\nReply: {reply[:300]}\n")
-        except OSError as e:
-            logger.error("[%s] 日志写入失败: %s", self.name, e)
+                f.write(f"[{ts}] Step {self._step}\n{text}\n\n")
+        except Exception:
+            pass
