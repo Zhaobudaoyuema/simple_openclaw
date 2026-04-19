@@ -9,6 +9,7 @@ Agent 执行引擎 — ReAct 循环。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,7 +78,7 @@ class AgentRunner:
         数据流（messages 是有序列表）：
           [system, ..., user, assistant(tool_calls), tool_result, ..., assistant, tool_result, ...]
         """
-        messages = list(spec.initial_messages)
+        messages     = list(spec.initial_messages)
         tools_used: list[str] = []
         tool_events: list[dict[str, str]] = []
         usage: dict[str, int] = {}
@@ -125,6 +126,9 @@ class AgentRunner:
                 assistant_msg = _build_assistant_message(resp)
                 messages.append(assistant_msg)
 
+                # 持久化累计 messages
+                _persist_messages(spec.workspace, messages)
+
                 return AgentRunResult(
                     final_content=final_content,
                     messages=messages,
@@ -156,6 +160,9 @@ class AgentRunner:
             for result in results:
                 messages.append(result)
 
+            # 持久化累计 messages（支持跨 runner 调用的增量追踪）
+            _persist_messages(spec.workspace, messages)
+
             # Checkpoint：工具执行完成后保存状态（崩溃恢复用）
             if spec.checkpoint_callback:
                 spec.checkpoint_callback({
@@ -172,6 +179,7 @@ class AgentRunner:
             "role": "assistant",
             "content": f"已达到最大迭代次数 {spec.max_iterations}。",
         })
+        _persist_messages(spec.workspace, messages)
 
         return AgentRunResult(
             final_content=None,
@@ -292,6 +300,19 @@ def _safe_finalize(hook, ctx: AgentHookContext, content: str | None) -> str | No
     except Exception as e:
         logger.warning("[hook] finalize_content 异常: %s", e)
         return content
+
+
+def _persist_messages(workspace: Path | None, messages: list[dict[str, Any]]) -> None:
+    """将当前累计的 messages 写入 workspace/runner_messages.json。"""
+    if workspace is None:
+        return
+    try:
+        path = workspace / "runner_messages.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+        logger.debug("[runner] 已写入 runner_messages.json (共 %d 条)", len(messages))
+    except Exception as e:
+        logger.warning("[runner] _persist_messages 异常: %s", e)
 
 
 def _log_error(

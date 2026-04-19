@@ -66,6 +66,7 @@ class CrawfishAgent:
         provider: LLMProvider,
         world_url: str,
         skill_dir: Path | None = None,
+        skill_paths: list[Path] | None = None,
         *,
         model: str = "MiniMax-M2.5-Lightning",
         max_iterations: int = 200,
@@ -76,6 +77,7 @@ class CrawfishAgent:
         self.personality = personality
         self.world_url = world_url
         self.skill_dir = skill_dir
+        self.skill_paths = skill_paths
         self.model = model
         self.max_iterations = max_iterations
         self._step = 0
@@ -98,10 +100,19 @@ class CrawfishAgent:
         if self._user:
             identity += f"\n【用户（USER.md）】\n{self._user[:200]}\n"
 
-        # 加载 skill
+        # 加载 skill（优先用 skill_paths 精确指定，否则扫描 skill_dir 目录）
         skills_text = ""
-        if skill_dir and skill_dir.exists():
-            skills_text = build_skills_prompt(skill_dir, self.name)
+        _skills_root = skill_dir if skill_dir and skill_dir.exists() else None
+        print(f"[DEBUG skill] skill_dir={skill_dir}  exists={skill_dir.exists() if skill_dir else 'N/A'}")
+        print(f"[DEBUG skill] skill_paths={skill_paths}")
+        print(f"[DEBUG skill] _skills_root={_skills_root}")
+        if _skills_root or skill_paths:
+            skills_text = build_skills_prompt(
+                _skills_root or Path("."),
+                self.name,
+                skill_paths=skill_paths,
+            )
+        print(f"[DEBUG skill] skills_text 长度={len(skills_text)}  前100字符={skills_text[:100]!r}")
 
         # 构建 workspace 描述
         workspace_abs = str(workspace.resolve())
@@ -267,43 +278,98 @@ class CrawfishAgent:
     def _build_observation(self) -> str:
         """构建本轮的 initial observation。"""
         import json as _json
+        import urllib.request
+        import urllib.error
 
         lines = [f"[Step {self._step}] 你在龙虾世界自主探索中。"]
         workspace_abs = str(self.workspace_obj.workspace.resolve())
+
+        # ── 读取 config.json（复用于注册状态和 daemon 端口） ──────────
+        config_path = self.workspace_obj.workspace / "clawsocial" / "config.json"
+        cfg: dict = {}
+        if config_path.exists():
+            try:
+                cfg = _json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # ── 注册状态检测 ──────────────────────────────────────────────
+        # config.json 实际字段：token, user_id（不是 my_id / my_name）
+        registered = bool(cfg.get("token")) and bool(cfg.get("user_id"))
+
+        # ── daemon 状态检测 ───────────────────────────────────────────
+        # 端口在 config.json["port"]（不存在 port.txt）
+        # 三层检测：端口 → PID 进程存活 → HTTP /status
+        import os as _os
+        port = cfg.get("port")
+        pid_file = self.workspace_obj.workspace / "clawsocial" / "daemon.pid"
+
+        daemon_status = "stopped"   # stopped / running / degraded
+        daemon_detail = ""
+
+        if port:
+            # 尝试 HTTP /status 做最终确认
+            try:
+                url = f"http://127.0.0.1:{port}/status"
+                with urllib.request.urlopen(url, timeout=2) as r:
+                    if r.status == 200:
+                        daemon_status = "running"
+                        daemon_detail = f"port={port}"
+            except Exception:
+                # HTTP 不通，但 pid 文件存在说明进程可能还活着（DEGRADED）
+                if pid_file.exists():
+                    try:
+                        pid = int(pid_file.read_text(encoding="utf-8").strip())
+                        _os.kill(pid, 0)
+                        daemon_status = "degraded"
+                        daemon_detail = f"pid={pid} 但 HTTP 无响应，WS 可能未连上 server"
+                    except (ValueError, OSError):
+                        daemon_status = "stopped"
+                else:
+                    daemon_status = "stopped"
+        elif pid_file.exists():
+            # config 里没有 port，但 pid 文件存在 → daemon 刚启动还没写入 port
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                _os.kill(pid, 0)
+                daemon_status = "degraded"
+                daemon_detail = f"pid={pid}，config.json 中尚无 port"
+            except (ValueError, OSError):
+                daemon_status = "stopped"
 
         if self._step == 1:
             lines.append("\n【环境状态】")
             lines.append(f"- workspace: {workspace_abs}")
 
-            config_path = self.workspace_obj.workspace / "clawsocial" / "config.json"
-            if config_path.exists():
-                try:
-                    cfg = _json.loads(config_path.read_text(encoding="utf-8"))
-                    has_token = bool(cfg.get("token", ""))
-                    my_name = cfg.get("my_name", "")
-                    my_id = cfg.get("my_id", 0)
-                    if has_token and my_id:
-                        lines.append(f"- 注册状态: ✅ 已注册 (name={my_name}, id={my_id})")
-                    else:
-                        lines.append("- 注册状态: ❌ 未注册，请按 SKILL 指引完成注册")
-                except Exception:
-                    lines.append("- config.json: 读取失败")
+            if registered:
+                uid = cfg.get("user_id")
+                uname = cfg.get("name") or cfg.get("workspace", "").rstrip("/\\").split("\\")[-1].split("/")[-1]
+                lines.append(f"- 注册状态: ✅ 已注册 (name={uname}, user_id={uid})")
             else:
-                lines.append("- config.json: 不存在，请按 SKILL 指引完成注册")
+                if config_path.exists() and cfg:
+                    missing = [k for k in ("token", "user_id") if not cfg.get(k)]
+                    lines.append(f"- 注册状态: ❌ config.json 缺少字段 {missing}，请重新注册")
+                else:
+                    lines.append("- 注册状态: ❌ 未注册，请执行 clawsocial setup 完成注册")
 
-            port_file = self.workspace_obj.workspace / "clawsocial" / "port.txt"
-            pid_file = self.workspace_obj.workspace / "clawsocial" / "daemon.pid"
-            if port_file.exists():
-                port = port_file.read_text(encoding="utf-8").strip()
-                lines.append(f"- daemon: ✅ 运行中 (port={port})")
-            elif pid_file.exists():
-                lines.append("- daemon: ⚠️ PID 文件存在但无端口")
+            if daemon_status == "running":
+                lines.append(f"- daemon: ✅ 运行中 ({daemon_detail})")
+            elif daemon_status == "degraded":
+                lines.append(f"- daemon: ⚠️ 进程存在但连接异常 ({daemon_detail})")
+                lines.append("  → 请检查 clawsocial-server 是否在运行，daemon 会自动重连")
             else:
-                lines.append("- daemon: ❌ 未启动")
+                if registered:
+                    lines.append("- daemon: ❌ 未启动，请执行 clawsocial start")
+                else:
+                    lines.append("- daemon: ❌ 未启动（注册完成后执行 clawsocial start）")
         else:
-            port_file = self.workspace_obj.workspace / "clawsocial" / "port.txt"
-            if not port_file.exists():
-                lines.append("⚠️ daemon 未运行")
+            # 非首步：只在真正有问题时才提示，避免骚扰正常运行的 Agent
+            if daemon_status == "stopped":
+                if registered:
+                    lines.append("⚠️ daemon 未运行，请执行 clawsocial start")
+                else:
+                    lines.append("⚠️ 未注册且 daemon 未运行，请执行 clawsocial setup")
+            # running / degraded 时不输出任何提示，让 Agent 专注于业务
 
         return "\n".join(lines)
 

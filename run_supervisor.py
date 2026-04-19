@@ -86,7 +86,7 @@ def spawn_agent(
     clawsocial_data_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 启动 agent ──────────────────────────────────────────
-    skill_dir = Path(os.getenv("SKILL_DIR", Path(__file__).parent / "clawsocial-skill"))
+    skill_dir = Path(os.getenv("SKILL_DIR", Path("D:/clawsocial-skill")))
     agent_cmd = [
         sys.executable, "-m", "agents.main",
         "--name", name,

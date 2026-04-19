@@ -38,6 +38,10 @@ def main():
     parser.add_argument("--model", default="MiniMax-M2.5-Lightning", help="LLM model name")
     parser.add_argument("--skills-dir", default=None, help="Skills directory (e.g. D:/clawsocial-skill)")
     parser.add_argument(
+        "--skill-paths", nargs="+", default=None,
+        help="精确指定要加载的 SKILL.md 文件路径列表（支持多文件）",
+    )
+    parser.add_argument(
         "--max-iterations", type=int, default=200,
         help="每个 step 的最大工具调用轮数 (default: 200)",
     )
@@ -55,6 +59,7 @@ def main():
 
     workspace = Path(args.workspace)
     skill_dir = Path(args.skills_dir) if args.skills_dir else None
+    skill_paths = [Path(p) for p in args.skill_paths] if args.skill_paths else None
 
     # ── Provider（替换旧的 LLMClient）─────────────────────────────
     provider = OpenAICompatProvider(
@@ -75,6 +80,7 @@ def main():
         provider=provider,
         world_url=args.world_url,
         skill_dir=skill_dir,
+        skill_paths=skill_paths,
         model=args.model,
         max_iterations=args.max_iterations,
         concurrent_tools=args.concurrent_tools,

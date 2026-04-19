@@ -118,6 +118,7 @@ def load_skill(skill_dir: Path, agent_name: str = "") -> SkillMetadata | None:
         SkillMetadata 或 None（SKILL.md 不存在）
     """
     md_path = skill_dir / "SKILL.md"
+    print(f"[DEBUG load_skill] skill_dir={skill_dir}  md_path={md_path}  exists={md_path.exists()}")
     if not md_path.exists():
         return None
 
@@ -192,22 +193,62 @@ def build_system_prompt(
     return "\n\n".join(sections)
 
 
-def build_skills_prompt(skills_root: Path, agent_name: str = "") -> str:
+def build_skills_prompt(
+    skills_root: Path,
+    agent_name: str = "",
+    skill_paths: list[Path] | None = None,
+) -> str:
     """
-    加载所有 skills，构建 skills 提示段落（用于注入到 system prompt）。
+    加载 skills，构建 skills 提示段落（用于注入到 system prompt）。
+
+    支持两种加载模式：
+    1. skill_paths（非 None）：精确指定 SKILL.md 文件列表，忽略 skills_root 目录扫描
+    2. skill_paths（None）：扫描 skills_root 目录下所有子目录，加载每个子目录的 SKILL.md
+
+    Args:
+        skills_root: skill 根目录（仅在 skill_paths=None 时使用）
+        agent_name: 当前 agent 名称（用于替换占位符）
+        skill_paths: 可选，精确指定要加载的 SKILL.md 文件路径列表
     """
     if not skills_root.exists():
         return ""
 
     lines = []
-    for skill_dir in sorted(skills_root.iterdir()):
-        if not skill_dir.is_dir():
-            continue
-        meta = load_skill(skill_dir, agent_name)
-        if not meta:
-            continue
-        emoji = f"{meta.emoji} " if meta.emoji else ""
-        lines.append(f"\n{'='*60}\n{emoji}{meta.name}\n{meta.content}\n{'='*60}\n")
+
+    # 检查根目录本身是否有 SKILL.md（有则优先加载，仅目录扫描模式）
+    root_md = skills_root / "SKILL.md"
+    if skill_paths is None and root_md.exists():
+        print(f"[DEBUG build_skills_prompt] 根目录有 SKILL.md → {root_md}")
+        meta = load_skill(skills_root, agent_name)
+        print(f"[DEBUG build_skills_prompt]   加载根目录 SKILL.md  → meta={'有' if meta else '无'}")
+        if meta:
+            emoji = f"{meta.emoji} " if meta.emoji else ""
+            lines.append(f"\n{'='*60}\n{emoji}{meta.name}\n{meta.content}\n{'='*60}\n")
+
+    if skill_paths is not None:
+        # 模式1：精确指定 skill 文件列表
+        print(f"[DEBUG build_skills_prompt] 模式=精确指定  skill_paths={skill_paths}")
+        for p in skill_paths:
+            p = Path(p)
+            skill_dir = p.parent
+            meta = load_skill(skill_dir, agent_name)
+            print(f"[DEBUG build_skills_prompt]   加载 {p.name}  → meta={'有' if meta else '无'}")
+            if not meta:
+                continue
+            emoji = f"{meta.emoji} " if meta.emoji else ""
+            lines.append(f"\n{'='*60}\n{emoji}{meta.name}\n{meta.content}\n{'='*60}\n")
+    else:
+        # 模式2：扫描 skills_root 目录
+        print(f"[DEBUG build_skills_prompt] 模式=目录扫描  skills_root={skills_root}")
+        for skill_dir_entry in sorted(skills_root.iterdir()):
+            if not skill_dir_entry.is_dir():
+                continue
+            meta = load_skill(skill_dir_entry, agent_name)
+            print(f"[DEBUG build_skills_prompt]   扫描到 {skill_dir_entry.name}  → meta={'有' if meta else '无'}")
+            if not meta:
+                continue
+            emoji = f"{meta.emoji} " if meta.emoji else ""
+            lines.append(f"\n{'='*60}\n{emoji}{meta.name}\n{meta.content}\n{'='*60}\n")
 
     if not lines:
         return ""

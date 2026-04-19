@@ -2,3 +2,26 @@
 .env
 .env.local
 .env.*.local
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime workspace (agent sessions, world state, logs)
+agents_workspace/
+tokens/
+message_session/
+
+# Build / dist
+*.egg-info/
+dist/
+build/
